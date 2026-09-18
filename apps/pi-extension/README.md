@@ -72,9 +72,19 @@ Start Pi in plan mode:
 pi --plan
 ```
 
-Or toggle it during a session with `/plannotator-plan-mode` or `Ctrl+Alt+P`. The command accepts an optional file path argument (`/plannotator-plan-mode plans/auth.md`) or prompts you to choose one interactively.
+Or toggle it during a session with `/plannotator-plan-mode` or `Ctrl+Alt+P`. With no filename, the agent chooses a Markdown plan file inside the working directory. There is no interactive file picker.
 
-In plan mode the agent is restricted — destructive commands are blocked, writes are limited to the plan file. It explores your codebase, then writes a plan using markdown checklists:
+To select the file before planning starts:
+
+```text
+/plannotator-plan-mode plans/auth.md
+```
+
+The path must end in `.md` or `.mdx` and resolve inside Pi's working directory, not merely inside the Git repository. Absolute paths inside that directory also work. The command treats its entire argument as one path, so spaces need no shell quotes. The file and its parent directories need not exist yet. Entering plan mode does not create them, overwrite an existing file, or start an agent turn. Send your planning prompt next.
+
+With a filename, the command enters planning rather than toggling it off. Repeating the same selection while planning has no effect. To change the selected file or start a new plan during execution, exit the current phase first with the no-argument command.
+
+During planning, built-in writes and edits are limited to the selected file. If no file was selected, they may target any Markdown file inside the working directory. Bash remains unrestricted; the planning instructions tell the agent not to run destructive commands. The agent explores your codebase, then writes a plan using Markdown checklists:
 
 ```markdown
 - [ ] Add validation to the login form
@@ -101,13 +111,15 @@ const response = await new Promise((resolve) => {
   pi.events.emit(PLANNOTATOR_REQUEST_CHANNEL, {
     requestId: crypto.randomUUID(),
     action: "plan-mode",
-    payload: { mode: "enter" }, // "enter" | "exit" | "toggle" | "status"
+    payload: { mode: "enter", planFilePath: "plans/auth.md" },
     respond: resolve,
   });
 });
 ```
 
-A handled response returns the resulting phase, for example `{ status: "handled", result: { phase: "planning" } }`.
+`mode` accepts `"enter"`, `"exit"`, `"toggle"`, or `"status"` and defaults to `"toggle"`. The optional `planFilePath` requires `mode: "enter"` and follows the command's validation rules. Invalid paths or attempts to replace an active selection return `status: "error"` without changing the phase.
+
+A handled response returns the resulting phase and the selected or last submitted path when known, for example `{ status: "handled", result: { phase: "planning", planFilePath: "plans/auth.md" } }`. `status` reports the same information without changing it. Omitting the path preserves the existing mode-only behavior.
 
 ### Configuring per-phase behavior
 
@@ -173,12 +185,14 @@ Later layers overwrite earlier ones. If a field is omitted, it inherits the valu
 
 Use these inside `instructions` strings. They render once, when the phase is entered:
 
-- `${planFilePath}` — current plan file path
+- `${planFilePath}` is the last submitted path, or the initially selected path before submission. If neither exists, it is the text `your plan file`. This is a template variable, not a configuration field.
 - `${todoList}` — remaining checklist items as markdown checkboxes (an entry-time snapshot; live updates arrive as separate per-turn messages)
 - `${completedCount}` — completed checklist count
 - `${totalCount}` — total checklist count
 - `${remainingCount}` — remaining checklist count
 - `${phase}` — current runtime phase (`planning`, `executing`, `reviewing`, or `idle`)
+
+The initial selection survives session resume, branch navigation, and compaction. Leaving plan mode clears it. When planning instructions are enabled, Plannotator also appends the selected path to the phase message, even if the template omits `${planFilePath}`. `plannotator_submit_plan` requires that same file when a selection exists; without one, the agent chooses the path as before.
 
 #### Behavior notes
 
@@ -211,6 +225,7 @@ Plannotator also listens on the shared `plannotator:request` event channel so ot
 
 Supported actions and payloads:
 
+- `plan-mode`: `{ mode?, planFilePath? }`, with `planFilePath` allowed only for `mode: "enter"`
 - `plan-review`: `{ planContent, planFilePath? }`
 - `review-status`: `{ reviewId }`
 - `code-review`: `{ cwd?, defaultBranch?, diffType?, vcsType?, useLocal?, prUrl?, patchFile? }`
@@ -293,7 +308,7 @@ During execution, the agent marks completed steps with `[DONE:n]` markers. Progr
 
 | Command | Description |
 |---------|-------------|
-| `/plannotator-plan-mode` | Toggle plan mode. The agent writes a markdown plan file anywhere in the working directory and submits its path |
+| `/plannotator-plan-mode [file]` | Toggle plan mode without an argument, or enter planning with a selected Markdown file inside the working directory |
 | `/plannotator-review` | Open code review UI for current changes |
 | `/plannotator-annotate <file>` | Open markdown file in annotation UI |
 | `/plannotator-last` | Annotate the last assistant message |
@@ -317,7 +332,7 @@ By default, the extension manages a state machine: **idle** → **planning** →
 During **planning**:
 - All tools from other extensions remain available
 - Bash is unrestricted — the agent is guided by the planning instructions not to run destructive commands
-- Writes and edits restricted to the plan file only
+- Built-in writes and edits are restricted to the selected plan file, or any Markdown file inside the working directory when no file was selected
 
 During **executing**:
 - Full tool access: `read`, `bash`, `edit`, `write`

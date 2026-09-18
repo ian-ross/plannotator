@@ -122,10 +122,14 @@ export interface PlannotatorRequestBase<A extends PlannotatorAction, P, R> {
 
 export interface PlannotatorPlanModePayload {
 	mode?: "enter" | "exit" | "toggle" | "status";
+	/** Optional markdown path inside cwd. Valid only with mode "enter". */
+	planFilePath?: string;
 }
 
 export interface PlannotatorPlanModeResult {
 	phase: "idle" | "planning" | "executing";
+	/** Selected or last submitted path, when known. */
+	planFilePath?: string;
 }
 
 export interface PlannotatorPlanReviewPayload {
@@ -290,6 +294,7 @@ export interface PlannotatorEventListenerOptions {
 	handlePlanMode?: (
 		mode: NonNullable<PlannotatorPlanModePayload["mode"]>,
 		ctx: ExtensionContext,
+		planFilePath?: string,
 	) => Promise<PlannotatorPlanModeResult> | PlannotatorPlanModeResult;
 }
 
@@ -339,7 +344,12 @@ export function registerPlannotatorEventListeners(
 						request.respond({ status: "error", error: "Invalid plan-mode payload.mode." });
 						return;
 					}
-					const result = await options.handlePlanMode(mode, ctx);
+					const planFilePath = request.payload?.planFilePath;
+					if (planFilePath !== undefined && (mode !== "enter" || typeof planFilePath !== "string" || !planFilePath.trim())) {
+						request.respond({ status: "error", error: "planFilePath must be a non-empty string and requires mode enter." });
+						return;
+					}
+					const result = await options.handlePlanMode(mode, ctx, planFilePath);
 					request.respond({ status: "handled", result });
 					return;
 				}

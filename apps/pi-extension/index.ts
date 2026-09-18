@@ -129,6 +129,7 @@ type SavedPhaseState = {
 type PersistedPlannotatorState = {
 	phase: Phase;
 	lastSubmittedPath?: string;
+	selectedPlanPath?: string | null;
 	savedState?: SavedPhaseState;
 	phaseAddedTools?: string[];
 	/** Whether the current phase's entry framing message was already delivered. */
@@ -299,21 +300,20 @@ export default function plannotator(pi: ExtensionAPI): void {
 	const currentPiSession = registerCurrentPiSession(pi);
 	let phase: Phase = "idle";
 	void registerPlannotatorEventListeners(pi, {
-		handlePlanMode: async (mode, ctx) => {
-			if (mode === "status") return { phase };
+		handlePlanMode: async (mode, ctx, planFilePath) => {
 			if (mode === "enter") {
-				if (phase === "idle") await enterPlanning(ctx);
-				return { phase };
-			}
-			if (mode === "exit") {
+				await enterPlanning(ctx, planFilePath);
+			} else if (mode === "exit") {
 				if (phase !== "idle") await exitToIdle(ctx);
-				return { phase };
+			} else if (mode === "toggle") {
+				await togglePlanMode(ctx);
 			}
-			await togglePlanMode(ctx);
-			return { phase };
+			const path = lastSubmittedPath ?? selectedPlanPath;
+			return { phase, ...(path ? { planFilePath: path } : {}) };
 		},
 	});
 	let lastSubmittedPath: string | null = null;
+	let selectedPlanPath: string | null = null;
 	let checklistItems: ChecklistItem[] = [];
 	let savedState: SavedPhaseState | null = null;
 	let phaseAddedTools: string[] = [];
@@ -488,6 +488,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 		pi.appendEntry("plannotator", {
 			phase,
 			lastSubmittedPath,
+			selectedPlanPath,
 			savedState,
 			phaseAddedTools,
 			framingDelivered,
@@ -579,7 +580,27 @@ export default function plannotator(pi: ExtensionAPI): void {
 		await syncTodoProvider(ctx);
 	}
 
-	async function enterPlanning(ctx: ExtensionContext): Promise<void> {
+	async function enterPlanning(ctx: ExtensionContext, planFilePath?: string): Promise<void> {
+		let path: string | null = null;
+		if (planFilePath !== undefined) {
+			if (typeof planFilePath !== "string" || !planFilePath.trim() || /[\u0000-\u001f\u007f]/.test(planFilePath) || !isPlanWritePathAllowed(planFilePath.trim(), ctx.cwd)) {
+				throw new Error("Plan path must name a markdown file (.md or .mdx) inside the working directory.");
+			}
+			path = relative(ctx.cwd, resolve(ctx.cwd, planFilePath.trim()));
+			try {
+				if (!statSync(resolve(ctx.cwd, path)).isFile()) throw new Error(`Plan path is not a regular file: ${path}`);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
+		if (phase !== "idle") {
+			if (path !== null && (phase !== "planning" || path !== selectedPlanPath)) {
+				throw new Error("Exit the current Plannotator phase before selecting a different plan file.");
+			}
+			return;
+		}
+		selectedPlanPath = path;
+		lastSubmittedPath = null;
 		phase = "planning";
 		framingDelivered = false;
 		// An undelivered plan-mode-off notice is superseded by the planning
@@ -591,7 +612,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 		await applyPhaseConfig(ctx, { restoreSavedState: false });
 		persistState();
 		ctx.ui.notify(
-			"Plannotator: planning mode enabled.",
+			selectedPlanPath ? `Plannotator: planning mode enabled. Plan file: ${selectedPlanPath}` : "Plannotator: planning mode enabled.",
 		);
 		const warning = getPlanReviewAvailabilityWarning({ hasUI: ctx.hasUI, hasPlanHtml: hasPlanBrowserHtml() });
 		if (warning) {
@@ -614,6 +635,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 		idleNoticePending = true;
 		checklistItems = [];
 		lastSubmittedPath = null;
+		selectedPlanPath = null;
 		// Re-detect for the next plan: a provider that appeared (or a transient
 		// write failure) should not be decided once for the whole session.
 		todoProvider = undefined;
@@ -660,9 +682,14 @@ export default function plannotator(pi: ExtensionAPI): void {
 	// ── Commands & Shortcuts ─────────────────────────────────────────────
 
 	pi.registerCommand("plannotator-plan-mode", {
-		description: "Toggle plannotator planning mode",
-		handler: async (_args, ctx) => {
-			await togglePlanMode(ctx);
+		description: "Toggle planning mode, or enter it with a markdown plan file path",
+		handler: async (args, ctx) => {
+			try {
+				if (args.trim()) await enterPlanning(ctx, args);
+				else await togglePlanMode(ctx);
+			} catch (error) {
+				ctx.ui.notify(`Plannotator: ${error instanceof Error ? error.message : String(error)}`, "error");
+			}
 		},
 	});
 
@@ -1264,6 +1291,12 @@ export default function plannotator(pi: ExtensionAPI): void {
 			}
 
 			const fullPath = resolve(ctx.cwd, inputPath);
+			if (selectedPlanPath && fullPath !== resolve(ctx.cwd, selectedPlanPath)) {
+				return {
+					content: [{ type: "text", text: `Error: submit the selected plan file: ${selectedPlanPath}` }],
+					details: { approved: false },
+				};
+			}
 
 			try {
 				if (!statSync(fullPath).isFile()) {
@@ -1472,6 +1505,9 @@ export default function plannotator(pi: ExtensionAPI): void {
 				reason: `Plannotator: during planning, ${verb} are limited to markdown files (.md, .mdx) inside the working directory. Blocked: ${inputPath}`,
 			};
 		}
+		if (selectedPlanPath && resolve(ctx.cwd, inputPath) !== resolve(ctx.cwd, selectedPlanPath)) {
+			return { block: true, reason: `Plannotator: during planning, write or edit only the selected plan file: ${selectedPlanPath}` };
+		}
 	});
 
 	// Deliver phase framing once per phase entry, plus per-turn todo status.
@@ -1504,7 +1540,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 		}
 
 		const profile = getPhaseProfile();
-		const planRef = lastSubmittedPath ?? "your plan file";
+		const planRef = lastSubmittedPath ?? selectedPlanPath ?? "your plan file";
 
 		if (phase === "executing" && lastSubmittedPath) {
 			// Re-read from disk each turn to stay current
@@ -1582,6 +1618,9 @@ Call ${PLAN_MARK_DONE_TOOL} immediately after each completed step and before the
 
 		let content = rendered.text;
 		if (phase === "planning") {
+			if (selectedPlanPath) {
+				content += `\n\nThe user selected this plan file: ${JSON.stringify(selectedPlanPath)}. Write and revise the plan there, then submit that same path with ${PLAN_SUBMIT_TOOL}. Do not choose a different filename.`;
+			}
 			const hook = readImprovementHook("enterplanmode-improve");
 			const pfmEnabled = loadConfig().pfmReminder === true;
 			const improveContext = composeImproveContext({
@@ -1715,7 +1754,8 @@ Call ${PLAN_MARK_DONE_TOOL} immediately after each completed step and before the
 
 		if (stateEntry?.data) {
 			phase = stateEntry.data.phase ?? options.phaseWhenUnrecorded;
-			lastSubmittedPath = stateEntry.data.lastSubmittedPath ?? lastSubmittedPath;
+			lastSubmittedPath = stateEntry.data.lastSubmittedPath ?? null;
+			selectedPlanPath = stateEntry.data.selectedPlanPath ?? null;
 			savedState = stateEntry.data.savedState ?? savedState;
 			phaseAddedTools = stateEntry.data.phaseAddedTools ?? phaseAddedTools;
 			// The framing message persists in the restored conversation history,
@@ -1731,6 +1771,8 @@ Call ${PLAN_MARK_DONE_TOOL} immediately after each completed step and before the
 			// phaseAddedTools are kept so the idle branch below can hand back
 			// tools and settings a now-abandoned branch's phase had taken.
 			phase = options.phaseWhenUnrecorded;
+			lastSubmittedPath = null;
+			selectedPlanPath = null;
 			framingDelivered = false;
 			// A path with no plannotator state never had plan mode, so no
 			// countermand is owed — and injecting one here would break the
@@ -1797,6 +1839,8 @@ Call ${PLAN_MARK_DONE_TOOL} immediately after each completed step and before the
 		}
 
 		if (phase === "idle") {
+			lastSubmittedPath = null;
+			selectedPlanPath = null;
 			releaseAddedPhaseTools();
 			if (savedState) {
 				await restoreSavedState(ctx);
