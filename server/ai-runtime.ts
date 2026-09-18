@@ -1,0 +1,184 @@
+import { execFileSync } from "node:child_process";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { Readable } from "node:stream";
+
+import { isAIEndpointPath } from "../generated/ai/endpoints.ts";
+import { resolveCommandFromWhichOutput } from "../generated/ai/providers/command-path.ts";
+import { handleApiNotFound, json, toWebRequest } from "./helpers.ts";
+
+export interface PiAIRuntime {
+	endpoints: Record<string, (req: Request) => Promise<Response>>;
+	dispose: () => void;
+}
+
+interface CreatePiAIRuntimeOptions {
+	cwd?: string;
+	getCwd?: () => string;
+}
+
+function whichCmd(cmd: string): string | null {
+	try {
+		const bin = process.platform === "win32" ? "where" : "which";
+		const output = execFileSync(bin, [cmd], {
+			encoding: "utf-8",
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		return resolveCommandFromWhichOutput(output);
+	} catch {
+		return null;
+	}
+}
+
+export async function createPiAIRuntime(options: CreatePiAIRuntimeOptions = {}): Promise<PiAIRuntime | null> {
+	try {
+		const ai = await import("../generated/ai/index.ts");
+		const cwd = options.cwd ?? process.cwd();
+		const registry = new ai.ProviderRegistry();
+		const sessionManager = new ai.SessionManager();
+		const modelDiscovery: Promise<void>[] = [];
+		const providerInitializers = new Map<string, () => Promise<void>>();
+
+		try {
+			await import("../generated/ai/providers/claude-agent-sdk.ts");
+			const claudePath = whichCmd("claude");
+			const provider = await ai.createProvider({
+				type: "claude-agent-sdk",
+				cwd,
+				...(claudePath && { claudeExecutablePath: claudePath }),
+			});
+			registry.register(provider);
+		} catch {
+			// Claude SDK not available.
+		}
+
+		try {
+			await import("../generated/ai/providers/codex-app-server.ts");
+			const codexPath = whichCmd("codex");
+			if (codexPath) {
+				const provider = await ai.createProvider({
+					type: "codex-sdk",
+					cwd,
+					...(codexPath ? { codexExecutablePath: codexPath } : {}),
+				});
+				const providerId = registry.register(provider);
+				if (provider && "fetchModels" in provider) {
+					providerInitializers.set(
+						providerId,
+						ai.createBestEffortOnce(
+							() => (provider as { fetchModels: () => Promise<void> }).fetchModels(),
+						),
+					);
+				}
+			}
+		} catch {
+			// Codex not available.
+		}
+
+		try {
+			await import("../generated/ai/providers/pi-sdk-node.ts");
+			const piPath = whichCmd("pi");
+			if (piPath) {
+				const provider = await ai.createProvider({
+					type: "pi-sdk",
+					cwd,
+					piExecutablePath: piPath,
+				} as any);
+				if (provider && "fetchModels" in provider) {
+					modelDiscovery.push(
+						(provider as { fetchModels: () => Promise<void> })
+							.fetchModels()
+							.catch(() => {}),
+					);
+				}
+				registry.register(provider);
+			}
+		} catch {
+			// Pi not available.
+		}
+
+		try {
+			await import("../generated/ai/providers/opencode-sdk.ts");
+			const opencodePath = whichCmd("opencode");
+			if (opencodePath) {
+				const provider = await ai.createProvider({
+					type: "opencode-sdk",
+					cwd,
+				});
+				const providerId = registry.register(provider);
+				// Deferred like Codex: fetchModels spawns `opencode serve`, so it
+				// must NOT run eagerly at startup — that spawned a server on every
+				// session for every user with opencode installed, and interrupted
+				// sessions orphaned it. The initializer runs on first explicit
+				// activation (?activate= from the model picker) or first opencode
+				// session.
+				if (provider && "fetchModels" in provider) {
+					providerInitializers.set(
+						providerId,
+						ai.createBestEffortOnce(
+							() => (provider as { fetchModels: () => Promise<void> }).fetchModels(),
+						),
+					);
+				}
+			}
+		} catch {
+			// OpenCode not available.
+		}
+
+		return {
+			endpoints: ai.createAIEndpoints({
+				registry,
+				sessionManager,
+				getCwd: options.getCwd,
+				beforeCapabilities: async () => {
+					await Promise.allSettled(modelDiscovery);
+				},
+				beforeProviderSession: async (providerId) => {
+					await providerInitializers.get(providerId)?.();
+				},
+			}),
+			dispose: () => {
+				sessionManager.disposeAll();
+				registry.disposeAll();
+			},
+		};
+	} catch {
+		return null;
+	}
+}
+
+export async function handlePiAIRequest(
+	req: IncomingMessage,
+	res: ServerResponse,
+	url: URL,
+	runtime: PiAIRuntime | null,
+): Promise<boolean> {
+	if (!url.pathname.startsWith("/api/ai/")) return false;
+	const handler = runtime?.endpoints[url.pathname];
+
+	if (handler) {
+		try {
+			const webReq = toWebRequest(req);
+			const webRes = await handler(webReq);
+			const headers: Record<string, string> = {};
+			webRes.headers.forEach((value, key) => {
+				headers[key] = value;
+			});
+			res.writeHead(webRes.status, headers);
+			if (webRes.body) {
+				Readable.fromWeb(webRes.body as any).pipe(res);
+			} else {
+				res.end();
+			}
+		} catch (err) {
+			json(res, { error: err instanceof Error ? err.message : "AI endpoint error" }, 500);
+		}
+	} else if (runtime || !isAIEndpointPath(url.pathname)) {
+		handleApiNotFound(res, url.pathname);
+	} else if (url.pathname === "/api/ai/capabilities" && req.method === "GET") {
+		json(res, { available: false, providers: [] });
+	} else {
+		json(res, { error: "AI backend not available" }, 503);
+	}
+
+	return true;
+}

@@ -1,0 +1,902 @@
+import { existsSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { createWorktreePool, type WorktreePool } from "./generated/worktree-pool.ts";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	prepareLocalReviewDiff,
+	reviewRuntime,
+	detectManagedVcs,
+	getVcsContext,
+	getVcsDiffFingerprint,
+	getVcsFileContentsForDiff,
+	canStageFiles,
+	runVcsDiff,
+	stageFile,
+	startAnnotateServer,
+	startPlanReviewServer,
+	startReviewServer,
+	type DiffType,
+	type VcsSelection,
+	unstageFile,
+} from "./server.ts";
+import { BROWSER_SESSION_STOPPED } from "./browser-session-error.ts";
+import { openBrowser, isRemoteSession } from "./server/network.ts";
+import { detectProjectName } from "./server/project.ts";
+import { parsePRUrl, checkPRAuth, fetchPR } from "./server/pr.ts";
+import {
+	getMRLabel,
+	getMRNumberLabel,
+	getDisplayRepo,
+	getCliName,
+	getCliInstallUrl,
+} from "./generated/pr-provider.ts";
+import { parseRemoteUrl } from "./generated/repo.ts";
+import { fetchRef, createWorktree, removeWorktree, ensureObjectAvailable } from "./generated/worktree.ts";
+import { loadConfig, resolveDefaultDiffType, resolveSharingEnabled } from "./generated/config.ts";
+import {
+	WorkspaceReviewSession,
+	type WorkspaceDiffType,
+} from "./generated/review-workspace.ts";
+import {
+	getPlanBrowserHtml,
+	getReviewBrowserHtml,
+	getStartupErrorMessage,
+	hasPlanBrowserHtml,
+	hasReviewBrowserHtml,
+} from "./plannotator-browser-runtime.ts";
+export { getLastAssistantMessageText } from "./assistant-message.ts";
+export {
+	getStartupErrorMessage,
+	hasPlanBrowserHtml,
+	hasReviewBrowserHtml,
+} from "./plannotator-browser-runtime.ts";
+
+export type AnnotateMode = "annotate" | "annotate-folder" | "annotate-last" | "annotate-app";
+export interface PlanReviewDecision {
+	approved: boolean;
+	feedback?: string;
+	savedPath?: string;
+	agentSwitch?: string;
+	permissionMode?: string;
+}
+
+export interface BrowserDecisionSession<T> {
+	url: string;
+	waitForDecision: () => Promise<T>;
+	stop: () => void;
+}
+
+type CodeReviewOptions = {
+	cwd?: string;
+	defaultBranch?: string;
+	diffType?: DiffType;
+	prUrl?: string;
+	vcsType?: VcsSelection;
+	useLocal?: boolean;
+	/**
+	 * Path to a unified-diff file to review without a repo — the file is read
+	 * once at call time (resolved relative to the caller's cwd, not ctx.cwd).
+	 * Mutually exclusive with `prUrl` and local/VCS modes. The path doubles as
+	 * the display label in the review header.
+	 */
+	patchFile?: string;
+	/**
+	 * `defaultBranch` / `diffType` came from user CLI flags (`--base` /
+	 * `--diff-type` on /plannotator-review): validate strictly (provider
+	 * matrix, PR/workspace refusal, rev-parse base probe), seed the server's
+	 * explicit-base bit, and pin the open state on /api/diff. Programmatic
+	 * callers omit it and keep the legacy forward-and-let-it-upgrade behavior.
+	 */
+	openStateFromFlags?: boolean;
+};
+
+type CodeReviewDecision = {
+	approved: boolean;
+	feedback?: string;
+	annotations?: unknown[];
+	agentSwitch?: string;
+	exit?: boolean;
+};
+
+const CODE_REVIEW_PROGRESS_STATUS = "plannotator-review";
+// stop -> registration timestamp. The timestamp lets self-preemption skip
+// sessions registered after the failing start began (a concurrent sibling's
+// fresh bind, not a stale leftover).
+const activeBrowserSessionStops = new Map<() => void, number>();
+
+function registerSessionStop(stop: () => void): () => void {
+	activeBrowserSessionStops.set(stop, Date.now());
+	return () => activeBrowserSessionStops.delete(stop);
+}
+
+// Exception-safe: one broken stop must not shield the remaining sessions.
+function runSessionStops(stops: Iterable<() => void>): void {
+	for (const stop of [...stops]) {
+		try {
+			stop();
+		} catch (err) {
+			console.error(
+				`Plannotator: failed to stop a browser session: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+	}
+}
+
+export function stopAllBrowserDecisionSessions(): void {
+	runSessionStops(activeBrowserSessionStops.keys());
+}
+
+/** Test seam: number of live tracked browser sessions. */
+export function getActiveBrowserSessionCount(): number {
+	return activeBrowserSessionStops.size;
+}
+
+const createStoppedError = () => {
+	const e = new Error("Plannotator browser session was stopped.");
+	e.name = BROWSER_SESSION_STOPPED;
+	return e;
+};
+
+function setCodeReviewProgress(ctx: ExtensionContext, message?: string): void {
+	ctx.ui.setStatus(
+		CODE_REVIEW_PROGRESS_STATUS,
+		message ? ctx.ui.theme.fg("accent", message) : undefined,
+	);
+}
+
+export interface PlanReviewBrowserSession extends BrowserDecisionSession<PlanReviewDecision> {
+	reviewId: string;
+	onDecision: (listener: (result: PlanReviewDecision) => void | Promise<void>) => () => void;
+}
+
+function delay(ms: number): Promise<void> {
+	return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+// Both fixed-port bind failures from listenOnPort: a single busy port and an
+// exhausted explicit range.
+const PORT_IN_USE_PATTERN = /\bPort \d+ in use\b|\bPort selection .+ exhausted\b/;
+
+// A fixed-port session (remote mode) abandoned without a decision keeps its
+// server listening forever in this long-lived pi process, so the next
+// command's bind fails (#1159). Live tracked sessions are the only thing
+// self-preemption may stop, and only those registered before the failing
+// start began: a session registered after that is a concurrent sibling's
+// fresh bind, not a stale leftover. Returns whether anything was stopped.
+function stopBrowserSessionsRegisteredBefore(startedAt: number): boolean {
+	const stale = [...activeBrowserSessionStops]
+		.filter(([, registeredAt]) => registeredAt < startedAt)
+		.map(([stop]) => stop);
+	if (stale.length === 0) return false;
+	runSessionStops(stale);
+	return true;
+}
+
+export async function startServerWithSelfPreemption<T>(
+	start: () => Promise<T>,
+	stopPrevious: (startedAt: number) => boolean = stopBrowserSessionsRegisteredBefore,
+): Promise<T> {
+	const startedAt = Date.now();
+	try {
+		return await start();
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		if (!PORT_IN_USE_PATTERN.test(message) || !stopPrevious(startedAt)) throw err;
+		// A fresh command is the user asking for a new review surface, so stale
+		// same-process sessions lose the port. Random-port local sessions never
+		// collide, so concurrent local sessions are untouched; a port held by
+		// another process still fails after the retry.
+		await delay(150);
+		return await start();
+	}
+}
+
+async function openBrowserForServer(serverUrl: string, ctx: ExtensionContext): Promise<void> {
+	const browserResult = await openBrowser(serverUrl);
+	if (isRemoteSession()) {
+		ctx.ui.notify(`[Plannotator] ${serverUrl}`, "info");
+	} else if (!browserResult.opened) {
+		ctx.ui.notify(`Open this URL to review: ${serverUrl}`, "info");
+	}
+}
+
+async function buildLocalWorkspaceReview(
+	root: string,
+	options: { requestedDiffType?: DiffType | WorkspaceDiffType; configuredDiffType?: DiffType; hideWhitespace?: boolean } = {},
+): Promise<WorkspaceReviewSession> {
+	return WorkspaceReviewSession.create({
+		async detectVcsType(cwd?: string) {
+			return (await detectManagedVcs(cwd))?.id;
+		},
+		getVcsContext,
+		runVcsDiff,
+		getVcsFileContentsForDiff,
+		getVcsDiffFingerprint,
+		canStageFiles,
+		stageFile,
+		unstageFile,
+	}, root, options);
+}
+
+async function openBrowserAndWait<T>(
+	server: { url: string; stop: () => void },
+	ctx: ExtensionContext,
+	waitForResult: () => Promise<T>,
+): Promise<T> {
+	// The archive path never goes through startBrowserDecisionSession, so track
+	// its stop here for the session's lifetime: an abandoned archive tab would
+	// otherwise hold its fixed port beyond self-preemption's reach (#1159).
+	const unregister = registerSessionStop(server.stop);
+	try {
+		await openBrowserForServer(server.url, ctx);
+		return await waitForDecisionWithCleanup(server, waitForResult);
+	} finally {
+		unregister();
+	}
+}
+
+async function waitForDecisionWithCleanup<T>(
+	server: { url: string; stop: () => void },
+	waitForResult: () => Promise<T>,
+): Promise<T> {
+	try {
+		const result = await waitForResult();
+		await delay(1500);
+		return result;
+	} finally {
+		server.stop();
+	}
+}
+
+export function startBrowserDecisionSession<T>(
+	server: { url: string; stop: () => void },
+	ctx: ExtensionContext,
+	waitForResult: () => Promise<T>,
+	signal?: AbortSignal,
+): BrowserDecisionSession<T> {
+	let stopped = false;
+	let stopReject: ((err: Error) => void) | undefined;
+	let decisionPromise: Promise<T> | undefined;
+	const stop = () => {
+		if (stopped) return;
+		stopped = true;
+		unregister();
+		signal?.removeEventListener("abort", stop);
+		server.stop();
+		stopReject?.(createStoppedError());
+		stopReject = undefined;
+	};
+	const unregister = registerSessionStop(stop);
+	if (signal?.aborted) {
+		// An already-cancelled tool must never open a tab: stop before launch.
+		stop();
+	} else {
+		signal?.addEventListener("abort", stop, { once: true });
+		// Fire-and-forget so the caller's turn is not blocked on a browser launch.
+		// Nothing may escape: an unhandled rejection here (a launcher that failed,
+		// or a `ctx` invalidated by a session replacement while the browser was
+		// opening) is an uncaught error that kills the whole pi process.
+		void openBrowserForServer(server.url, ctx).catch((err: unknown) => {
+			console.error(
+				`Plannotator: could not announce the browser URL ${server.url}: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		});
+	}
+
+	return {
+		url: server.url,
+		waitForDecision: () => {
+			if (decisionPromise) return decisionPromise;
+			if (stopped) return Promise.reject(createStoppedError());
+			decisionPromise = (async () => {
+				const stoppedPromise = new Promise<never>((_, reject) => {
+					stopReject = reject;
+				});
+				try {
+					const result = await Promise.race([waitForResult(), stoppedPromise]);
+					stopReject = undefined;
+					await delay(1500);
+					return result;
+				} finally {
+					stop();
+				}
+			})();
+			return decisionPromise;
+		},
+		stop,
+	};
+}
+
+export async function startPlanReviewBrowserSession(
+	ctx: ExtensionContext,
+	planContent: string,
+	signal?: AbortSignal,
+): Promise<PlanReviewBrowserSession> {
+	if (!ctx.hasUI) {
+		throw new Error("Plannotator browser review is unavailable in this session.");
+	}
+	const planHtmlContent = getPlanBrowserHtml();
+	if (!planHtmlContent) {
+		throw new Error("Plannotator browser review is unavailable in this session.");
+	}
+
+	const server = await startServerWithSelfPreemption(() => startPlanReviewServer({
+		plan: planContent,
+		htmlContent: planHtmlContent,
+		origin: "pi",
+		sharingEnabled: resolveSharingEnabled(loadConfig()),
+		shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
+		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
+	}));
+
+	const session = startBrowserDecisionSession(server, ctx, server.waitForDecision, signal);
+	server.onDecision(() => {
+		setTimeout(() => session.stop(), 1500);
+	});
+
+	return {
+		...session,
+		reviewId: server.reviewId,
+		onDecision: server.onDecision,
+	};
+}
+
+export async function openPlanReviewBrowser(
+	ctx: ExtensionContext,
+	planContent: string,
+	signal?: AbortSignal,
+): Promise<PlanReviewDecision> {
+	const session = await startPlanReviewBrowserSession(ctx, planContent, signal);
+	return session.waitForDecision();
+}
+
+export function shouldUseLocalPrCheckout(options: { useLocal?: boolean }): boolean {
+	return options.useLocal !== false;
+}
+
+export async function openCodeReview(
+	ctx: ExtensionContext,
+	options: CodeReviewOptions = {},
+): Promise<CodeReviewDecision> {
+	const session = await startCodeReviewBrowserSession(ctx, options);
+	return session.waitForDecision();
+}
+
+export async function startCodeReviewBrowserSession(
+	ctx: ExtensionContext,
+	options: CodeReviewOptions = {},
+): Promise<BrowserDecisionSession<CodeReviewDecision>> {
+	try {
+		return await createCodeReviewBrowserSession(ctx, options);
+	} finally {
+		setCodeReviewProgress(ctx);
+	}
+}
+
+async function createCodeReviewBrowserSession(
+	ctx: ExtensionContext,
+	options: CodeReviewOptions,
+): Promise<BrowserDecisionSession<CodeReviewDecision>> {
+	if (!ctx.hasUI) {
+		throw new Error("Plannotator code review browser is unavailable in this session.");
+	}
+	const reviewHtmlContent = getReviewBrowserHtml();
+	if (!reviewHtmlContent) {
+		throw new Error("Plannotator code review browser is unavailable in this session.");
+	}
+
+	const urlArg = options.prUrl;
+	const isPRMode = urlArg?.startsWith("http://") || urlArg?.startsWith("https://");
+	const openStateFromFlags =
+		options.openStateFromFlags === true &&
+		(options.defaultBranch !== undefined || options.diffType !== undefined);
+
+	let rawPatch: string;
+	let gitRef: string;
+	let diffError: string | undefined;
+	let gitCtx: Awaited<ReturnType<typeof prepareLocalReviewDiff>>["gitContext"] | undefined;
+	let prMetadata: Awaited<ReturnType<typeof fetchPR>>["metadata"] | undefined;
+	let prPatchIncomplete = false;
+	let diffType: DiffType | WorkspaceDiffType | undefined;
+	let agentCwd: string | undefined;
+	let initialBase: string | undefined;
+	let initialBaseExplicit = false;
+	let initialFingerprint: string | undefined;
+	let worktreeCleanup: (() => void | Promise<void>) | undefined;
+	let worktreePool: WorktreePool | undefined;
+	let exitHandler: (() => void) | undefined;
+	let workspace: WorkspaceReviewSession | undefined;
+
+	if (isPRMode && urlArg) {
+		// --- PR Review Mode ---
+		// The base comes from the pull request — the open-state flags always
+		// error here, before any auth check or platform fetch.
+		if (openStateFromFlags) {
+			const { resolveReviewOpenState } = await import("./generated/review-open-state.ts");
+			const openState = resolveReviewOpenState({
+				parsed: { base: options.defaultBranch, diffType: options.diffType },
+				isPRMode: true,
+				isWorkspace: false,
+				resolvedDefaultDiffType: resolveDefaultDiffType(loadConfig()),
+			});
+			if (openState.error) throw new Error(openState.error);
+		}
+		const prRef = parsePRUrl(urlArg);
+		if (!prRef) {
+			throw new Error(
+				`Invalid PR/MR URL: ${urlArg}\n` +
+				"Supported formats:\n" +
+				"  GitHub: https://github.com/owner/repo/pull/123\n" +
+				"  GitLab: https://gitlab.com/group/project/-/merge_requests/42",
+			);
+		}
+
+		const cliName = getCliName(prRef);
+		const cliUrl = getCliInstallUrl(prRef);
+
+		try {
+			await checkPRAuth(prRef);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			if (msg.includes("not found") || msg.includes("ENOENT")) {
+				throw new Error(`${cliName === "gh" ? "GitHub" : "GitLab"} CLI (${cliName}) is not installed. Install it from ${cliUrl}`);
+			}
+			throw err;
+		}
+
+		setCodeReviewProgress(
+			ctx,
+			`Fetching ${getMRLabel(prRef)} ${getMRNumberLabel(prRef)} from ${getDisplayRepo(prRef)}...`,
+		);
+		const pr = await fetchPR(prRef);
+		rawPatch = pr.rawPatch;
+		gitRef = `${getMRLabel(prRef)} ${getMRNumberLabel(prRef)}`;
+		prMetadata = pr.metadata;
+		prPatchIncomplete = pr.patchIncomplete ?? false;
+
+		if (shouldUseLocalPrCheckout(options)) {
+			// Create local worktree for agent file access (--local is the default for PR reviews)
+			let localPath: string | undefined;
+			let sessionDir: string | undefined;
+			try {
+				const repoDir = options.cwd ?? ctx.cwd;
+				const identifier = prMetadata.platform === "github"
+					? `${prMetadata.owner}-${prMetadata.repo}-${prMetadata.number}`
+					: `${prMetadata.projectPath.replace(/\//g, "-")}-${prMetadata.iid}`;
+				const suffix = Math.random().toString(36).slice(2, 8);
+				const prNumber = prMetadata.platform === "github" ? prMetadata.number : prMetadata.iid;
+				sessionDir = join(realpathSync(tmpdir()), `plannotator-pr-${identifier}-${suffix}`);
+				localPath = join(sessionDir, "pool", `pr-${prNumber}`);
+				const fetchRefStr = prMetadata.platform === "github"
+					? `refs/pull/${prMetadata.number}/head`
+					: `refs/merge-requests/${prMetadata.iid}/head`;
+
+				// Validate inputs from platform API to prevent git flag/path injection
+				if (prMetadata.baseBranch.includes('..') || prMetadata.baseBranch.startsWith('-')) throw new Error(`Invalid base branch: ${prMetadata.baseBranch}`);
+				if (!/^[0-9a-f]{40,64}$/i.test(prMetadata.baseSha)) throw new Error(`Invalid base SHA: ${prMetadata.baseSha}`);
+
+				// Detect same-repo vs cross-repo (must match both owner/repo AND host)
+				let isSameRepo = false;
+				try {
+					const remoteResult = await reviewRuntime.runGit(["remote", "get-url", "origin"], { cwd: repoDir });
+					if (remoteResult.exitCode === 0) {
+						const remoteUrl = remoteResult.stdout.trim();
+						const currentRepo = parseRemoteUrl(remoteUrl);
+						const prRepo = prMetadata.platform === "github"
+							? `${prMetadata.owner}/${prMetadata.repo}`
+							: prMetadata.projectPath;
+						const repoMatches = !!currentRepo && currentRepo.toLowerCase() === prRepo.toLowerCase();
+						const sshHost = remoteUrl.match(/^[^@]+@([^:]+):/)?.[1];
+						const httpsHost = (() => { try { return new URL(remoteUrl).hostname; } catch { return null; } })();
+						const remoteHost = (sshHost || httpsHost || "").toLowerCase();
+						const prHost = prMetadata.host.toLowerCase();
+						isSameRepo = repoMatches && remoteHost === prHost;
+					}
+				} catch { /* not in a git repo — cross-repo path */ }
+
+				if (isSameRepo) {
+					// ── Same-repo: fast worktree path ──
+					setCodeReviewProgress(ctx, `Preparing local ${getMRLabel(prRef)} checkout...`);
+					await fetchRef(reviewRuntime, prMetadata.baseBranch, { cwd: repoDir });
+					await ensureObjectAvailable(reviewRuntime, prMetadata.baseSha, { cwd: repoDir });
+					await fetchRef(reviewRuntime, fetchRefStr, { cwd: repoDir });
+
+					await createWorktree(reviewRuntime, {
+						ref: "FETCH_HEAD",
+						path: localPath,
+						detach: true,
+						cwd: repoDir,
+					});
+
+					const wtRepoDir = repoDir;
+					exitHandler = () => {
+						try {
+							for (const entry of worktreePool?.entries() ?? []) {
+								spawnSync("git", ["worktree", "remove", "--force", entry.path], { cwd: wtRepoDir });
+							}
+						} catch {}
+						if (sessionDir) try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
+					};
+					worktreeCleanup = async () => {
+						if (exitHandler) { process.removeListener("exit", exitHandler); exitHandler = undefined; }
+						if (worktreePool) await worktreePool.cleanup(reviewRuntime);
+						if (sessionDir) try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
+					};
+					process.once("exit", exitHandler);
+				} else {
+					// ── Cross-repo: shallow clone + fetch PR head ──
+					const prRepo = prMetadata.platform === "github"
+						? `${prMetadata.owner}/${prMetadata.repo}`
+						: prMetadata.projectPath;
+					if (/^-/.test(prRepo)) throw new Error(`Invalid repository identifier: ${prRepo}`);
+					const cli = prMetadata.platform === "github" ? "gh" : "glab";
+					const host = prMetadata.host;
+					// gh/glab repo clone doesn't accept --hostname; set GH_HOST/GITLAB_HOST env instead
+					const isDefaultHost = host === "github.com" || host === "gitlab.com";
+					const cloneEnv = isDefaultHost ? undefined : {
+						...process.env,
+						...(prMetadata.platform === "github" ? { GH_HOST: host } : { GITLAB_HOST: host }),
+					};
+
+					setCodeReviewProgress(ctx, `Cloning ${prRepo}...`);
+					const cloneResult = spawnSync(cli, ["repo", "clone", prRepo, localPath, "--", "--depth=1", "--no-checkout"], { encoding: "utf-8", env: cloneEnv });
+					if ((cloneResult.status ?? 1) !== 0) {
+						throw new Error(`${cli} repo clone failed: ${(cloneResult.stderr ?? "").trim()}`);
+					}
+
+					setCodeReviewProgress(ctx, `Fetching ${getMRLabel(prRef)} branch...`);
+					const fetchResult = await reviewRuntime.runGit(["fetch", "--depth=200", "origin", fetchRefStr], { cwd: localPath });
+					if (fetchResult.exitCode !== 0) throw new Error(`Failed to fetch PR head ref: ${fetchResult.stderr.trim()}`);
+
+					const checkoutResult = await reviewRuntime.runGit(["checkout", "FETCH_HEAD"], { cwd: localPath });
+					if (checkoutResult.exitCode !== 0) {
+						throw new Error(`git checkout FETCH_HEAD failed: ${checkoutResult.stderr.trim()}`);
+					}
+
+					// Best-effort: create base refs so agent diffs work
+					const baseFetch = await reviewRuntime.runGit(["fetch", "--depth=200", "origin", prMetadata.baseSha], { cwd: localPath });
+					if (baseFetch.exitCode !== 0) {
+						ctx.ui.notify("Failed to fetch the PR base commit; agent diffs may be inaccurate.", "warning");
+					}
+					await reviewRuntime.runGit(["branch", "--", prMetadata.baseBranch, prMetadata.baseSha], { cwd: localPath });
+					await reviewRuntime.runGit(["update-ref", `refs/remotes/origin/${prMetadata.baseBranch}`, prMetadata.baseSha], { cwd: localPath });
+
+					exitHandler = () => {
+						if (sessionDir) try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
+					};
+					worktreeCleanup = () => {
+						if (exitHandler) { process.removeListener("exit", exitHandler); exitHandler = undefined; }
+						if (sessionDir) try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
+					};
+					process.once("exit", exitHandler);
+				}
+
+				agentCwd = localPath;
+				worktreePool = createWorktreePool(
+					{ sessionDir: sessionDir!, repoDir, isSameRepo },
+					{ path: localPath, prUrl: prMetadata.url, number: prNumber, ready: true },
+				);
+				setCodeReviewProgress(ctx, "Starting code review...");
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				ctx.ui.notify(`Local checkout failed; using the remote diff instead: ${detail}`, "warning");
+				setCodeReviewProgress(ctx, "Starting code review from remote diff...");
+				if (exitHandler) { process.removeListener("exit", exitHandler); exitHandler = undefined; }
+				if (sessionDir) try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
+				agentCwd = undefined;
+				worktreePool = undefined;
+				worktreeCleanup = undefined;
+			}
+		}
+	} else if (options.patchFile !== undefined) {
+		// --- Static Patch Mode ---
+		// Caller-supplied unified diff, reviewed without any repository: the
+		// server serves rawPatch as-is, workspace undefined, gitContext undefined,
+		// diffType "static-patch" — identical to the direct CLI's --patch-file
+		// path. No refresh: there is no live tree to recompute against; the
+		// initial patch is the session's whole content.
+		// `-` means stdin, which only the direct CLI has: this host reaches the
+		// review through an extension event with no stdin of its own, so refuse
+		// rather than reading a file literally named "-".
+		if (options.patchFile === "-") {
+			throw new Error(
+				"--patch-file - (stdin) is not available here; pass a file path instead",
+			);
+		}
+		rawPatch = readFileSync(resolve(options.cwd ?? ctx.cwd, options.patchFile), "utf-8");
+		if (!rawPatch.trim()) {
+			throw new Error("Static patch review requires non-empty unified-diff content.");
+		}
+		gitRef = options.patchFile;
+		diffType = "static-patch";
+	} else {
+		// --- Local Review Mode ---
+		const cwd = options.cwd ?? ctx.cwd;
+		const config = loadConfig();
+		const managedVcs = await detectManagedVcs(cwd, options.vcsType);
+		const forcedVcs = !!options.vcsType && options.vcsType !== "auto";
+		// Flag-sourced open state: validate strictly before any diff work, and
+		// resolve the effective requested base/diff type (promotion included).
+		// Programmatic callers keep the verbatim pass-through below.
+		let requestedBase = options.defaultBranch;
+		let requestedDiffType = options.diffType;
+		if (openStateFromFlags) {
+			const { resolveReviewOpenState } = await import("./generated/review-open-state.ts");
+			if (managedVcs || forcedVcs) {
+				const providerId = (managedVcs?.id ?? options.vcsType) as
+					| "git"
+					| "gitbutler"
+					| "jj"
+					| "p4"
+					| undefined;
+				let baseResolves: boolean | undefined;
+				if (requestedBase !== undefined && providerId === "git") {
+					// --end-of-options blocks flag injection through hostile refs;
+					// the probe is what keeps a typo'd base from producing a
+					// confidently-mislabelled merge-base→HEAD diff.
+					const probe = await reviewRuntime.runGit(
+						["rev-parse", "--verify", "--quiet", "--end-of-options", `${requestedBase}^{commit}`],
+						{ cwd },
+					);
+					baseResolves = probe.exitCode === 0;
+				}
+				const openState = resolveReviewOpenState({
+					parsed: { base: requestedBase, diffType: requestedDiffType },
+					isPRMode: false,
+					isWorkspace: false,
+					providerId,
+					resolvedDefaultDiffType: resolveDefaultDiffType(config),
+					baseResolves,
+				});
+				if (openState.error) throw new Error(openState.error);
+				for (const notice of openState.notices) ctx.ui.notify(notice, "info");
+				requestedBase = openState.requestedBase;
+				requestedDiffType = openState.requestedDiffType;
+			} else {
+				const openState = resolveReviewOpenState({
+					parsed: { base: requestedBase, diffType: requestedDiffType },
+					isPRMode: false,
+					isWorkspace: true,
+					resolvedDefaultDiffType: resolveDefaultDiffType(config),
+				});
+				if (openState.error) throw new Error(openState.error);
+			}
+		}
+		if (managedVcs || forcedVcs) {
+			const result = await prepareLocalReviewDiff({
+				cwd,
+				vcsType: options.vcsType,
+				requestedDiffType,
+				requestedBase,
+				configuredDiffType: resolveDefaultDiffType(config),
+				hideWhitespace: config.diffOptions?.hideWhitespace ?? false,
+			});
+			gitCtx = result.gitContext;
+			diffType = result.diffType;
+			rawPatch = result.rawPatch;
+			gitRef = result.gitRef;
+			diffError = result.error;
+			initialFingerprint = result.fingerprint;
+			// Remember which base the initial diff was computed against so it can
+			// be forwarded to the server below. Only matters when the caller
+			// overrode the detected default; otherwise it matches gitCtx already.
+			initialBase = result.base;
+			// A flag-sourced base is a user-picked base: canonicalization off,
+			// startup upgrade suppressed (server-side explicit bit).
+			initialBaseExplicit = openStateFromFlags && requestedBase !== undefined;
+		} else {
+			workspace = await buildLocalWorkspaceReview(cwd, {
+				requestedDiffType: options.diffType,
+				configuredDiffType: resolveDefaultDiffType(config),
+				hideWhitespace: config.diffOptions?.hideWhitespace ?? false,
+			});
+			if (workspace.repos.length === 0) {
+				throw new Error("Not in a VCS repo and no nested Git/JJ/GitButler repositories were found.");
+			}
+			rawPatch = workspace.rawPatch;
+			gitRef = workspace.gitRef;
+			diffError = workspace.error;
+			diffType = workspace.diffType;
+			agentCwd = workspace.root;
+		}
+	}
+
+	const server = await startServerWithSelfPreemption(() => startReviewServer({
+		rawPatch,
+		gitRef,
+		error: diffError,
+		origin: "pi",
+		project: detectProjectName(),
+		diffType,
+		gitContext: gitCtx,
+		initialBase,
+		initialBaseExplicit,
+		openStatePinned: openStateFromFlags,
+		initialFingerprint,
+		prMetadata,
+		prPatchIncomplete,
+		workspace,
+		agentCwd,
+		worktreePool,
+		htmlContent: reviewHtmlContent,
+		sharingEnabled: resolveSharingEnabled(loadConfig()),
+		// Pi's review consumer (index.ts) sends approve-time feedback after the
+		// approved prompt, so the advert is unconditional — same shape as the
+		// annotate session's advert below (spec §6.4).
+		approvalNotesSupported: true,
+		shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
+		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
+		onCleanup: worktreeCleanup,
+	}));
+
+	return startBrowserDecisionSession(server, ctx, server.waitForDecision);
+}
+
+export async function openMarkdownAnnotation(
+	ctx: ExtensionContext,
+	filePath: string,
+	markdown: string,
+	mode: AnnotateMode,
+	folderPath?: string,
+	sourceInfo?: string,
+	sourceConverted?: boolean,
+	gate?: boolean,
+): Promise<{ feedback: string; exit?: boolean; approved?: boolean; selectedMessageId?: string; feedbackScope?: "message" | "messages" }> {
+	const session = await startMarkdownAnnotationSession(
+		ctx,
+		filePath,
+		markdown,
+		mode,
+		folderPath,
+		sourceInfo,
+		sourceConverted,
+		gate,
+	);
+	return session.waitForDecision();
+}
+
+export async function startMarkdownAnnotationSession(
+	ctx: ExtensionContext,
+	filePath: string,
+	markdown: string,
+	mode: AnnotateMode,
+	folderPath?: string,
+	sourceInfo?: string,
+	sourceConverted?: boolean,
+	gate?: boolean,
+	rawHtml?: string,
+	renderHtml?: boolean,
+	convertHtml?: boolean,
+	recentMessages?: { messageId: string; text: string; timestamp?: string }[],
+	/** Live app session (mode "annotate-app"): the loopback dev-server URL to
+	 * proxy. The bridge sources are loaded here from the vendored
+	 * bridge-script module, mirroring how the Bun CLI supplies them. */
+	liveTargetUrl?: string,
+): Promise<BrowserDecisionSession<{ feedback: string; exit?: boolean; approved?: boolean; selectedMessageId?: string; feedbackScope?: "message" | "messages" }>> {
+	if (!ctx.hasUI) {
+		throw new Error("Plannotator annotation browser is unavailable in this session.");
+	}
+	const planHtmlContent = getPlanBrowserHtml();
+	if (!planHtmlContent) {
+		throw new Error("Plannotator annotation browser is unavailable in this session.");
+	}
+
+	// Live sessions serve the page through the proxy; the bridge constants are
+	// lazy-imported so plain annotate sessions never pay for the ~large
+	// string module.
+	let liveApp:
+		| { targetUrl: string; bridgeScript: string; bridgeBootstrap: string; annotationCss: string }
+		| undefined;
+	if (mode === "annotate-app" && liveTargetUrl) {
+		const bridge = await import("./generated/bridge-script.ts");
+		liveApp = {
+			targetUrl: liveTargetUrl,
+			bridgeScript: bridge.BRIDGE_SCRIPT,
+			bridgeBootstrap: bridge.LIVE_BRIDGE_BOOTSTRAP,
+			annotationCss: bridge.ANNOTATION_HIGHLIGHT_CSS,
+		};
+	}
+
+	let resolvedMarkdown = markdown;
+	if (!renderHtml && !resolvedMarkdown.trim() && existsSync(filePath)) {
+		try {
+			const fileStat = statSync(filePath);
+			if (!fileStat.isDirectory()) {
+				resolvedMarkdown = readFileSync(filePath, "utf-8");
+			}
+		} catch {
+			// fall back to provided markdown
+		}
+	}
+
+	const server = await startServerWithSelfPreemption(() => startAnnotateServer({
+		markdown: resolvedMarkdown,
+		filePath,
+		origin: "pi",
+		mode,
+		liveApp,
+		folderPath,
+		recentMessages,
+		sourceInfo,
+		sourceConverted,
+		gate,
+		approvalNotesSupported: true,
+		clientLeaseSupported: gate === true && !isRemoteSession(),
+		rawHtml,
+		renderHtml,
+		convertHtml,
+		htmlContent: planHtmlContent,
+		sharingEnabled: resolveSharingEnabled(loadConfig()),
+		shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
+		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
+		agentCwd: ctx.cwd,
+		project: detectProjectName(),
+	}));
+
+	return startBrowserDecisionSession(server, ctx, server.waitForDecision);
+}
+
+export async function openLastMessageAnnotation(
+	ctx: ExtensionContext,
+	lastText: string,
+	gate?: boolean,
+	recentMessages?: { messageId: string; text: string; timestamp?: string }[],
+): Promise<{ feedback: string; exit?: boolean; approved?: boolean; selectedMessageId?: string; feedbackScope?: "message" | "messages" }> {
+	const session = await startLastMessageAnnotationSession(ctx, lastText, gate, recentMessages);
+	return session.waitForDecision();
+}
+
+export async function startLastMessageAnnotationSession(
+	ctx: ExtensionContext,
+	lastText: string,
+	gate?: boolean,
+	recentMessages?: { messageId: string; text: string; timestamp?: string }[],
+): Promise<BrowserDecisionSession<{ feedback: string; exit?: boolean; approved?: boolean; selectedMessageId?: string; feedbackScope?: "message" | "messages" }>> {
+	return startMarkdownAnnotationSession(
+		ctx,
+		"last-message",
+		lastText,
+		"annotate-last",
+		undefined,
+		undefined,
+		undefined,
+		gate,
+		undefined,
+		undefined,
+		undefined,
+		recentMessages,
+	);
+}
+
+export async function openArchiveBrowserAction(
+	ctx: ExtensionContext,
+	customPlanPath?: string,
+): Promise<{ opened: boolean }> {
+	if (!ctx.hasUI) {
+		throw new Error("Plannotator archive browser is unavailable in this session.");
+	}
+	const planHtmlContent = getPlanBrowserHtml();
+	if (!planHtmlContent) {
+		throw new Error("Plannotator archive browser is unavailable in this session.");
+	}
+
+	const server = await startServerWithSelfPreemption(() => startPlanReviewServer({
+		plan: "",
+		htmlContent: planHtmlContent,
+		origin: "pi",
+		mode: "archive",
+		customPlanPath,
+		sharingEnabled: resolveSharingEnabled(loadConfig()),
+		shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
+		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
+	}));
+
+	return openBrowserAndWait(server, ctx, async () => {
+		if (server.waitForDone) {
+			await server.waitForDone();
+		}
+		return { opened: true };
+	});
+}

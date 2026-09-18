@@ -1,0 +1,426 @@
+/**
+ * Network utilities — remote detection, port binding, browser opening.
+ * isRemoteSession, getServerPort, listenOnPort, openBrowser
+ */
+
+import { spawn } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
+import type { Server } from "node:http";
+import os from "node:os";
+import { delimiter, join } from "node:path";
+import { loadConfig, resolveUrlHost, resolveUseGlimpse } from "../generated/config.ts";
+import { parsePortSelection } from "../generated/port-range.ts";
+import { isAutoUrlHost, resolveAutoHostCached } from "../generated/tailscale.ts";
+
+const DEFAULT_REMOTE_PORT = 19432;
+const LOOPBACK_HOST = "127.0.0.1";
+const NOOP_BROWSER_VALUES = new Set(["true", "false", "none", ":", "0", "1"]);
+
+function isAddressInUseError(err: unknown): boolean {
+	return err instanceof Error && (
+		(err as NodeJS.ErrnoException).code === "EADDRINUSE" ||
+		err.message.includes("EADDRINUSE")
+	);
+}
+
+export function isNoOpBrowserSentinel(value: string | undefined): boolean {
+	if (!value) return false;
+	return NOOP_BROWSER_VALUES.has(value.trim().toLowerCase());
+}
+
+/**
+ * True for a value that must be handed to cmd.exe under WSL: a Windows-style
+ * path (C:\..., C:/...) or a /mnt/<drive> mount of one, or a `.exe` name.
+ */
+function isWindowsBrowserTarget(value: string): boolean {
+	return (
+		/^[A-Za-z]:[\\/]/.test(value) ||
+		value.startsWith("/mnt/") ||
+		value.toLowerCase().endsWith(".exe")
+	);
+}
+
+/**
+ * True when PLANNOTATOR_BROWSER names something the Linux side can execute
+ * itself: a POSIX path (/..., ./..., ../...) or a bare name resolvable to an
+ * executable on the Linux PATH. Under WSL those must NOT go through cmd.exe,
+ * which cannot resolve them (#1472).
+ */
+export function isPosixBrowserTarget(value: string): boolean {
+	if (isWindowsBrowserTarget(value)) return false;
+	if (value.startsWith("/") || value.startsWith("./") || value.startsWith("../")) {
+		return true;
+	}
+	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
+		if (!entry) continue;
+		try {
+			const stat = statSync(join(entry, value));
+			if (stat.isFile() && (stat.mode & 0o111) !== 0) return true;
+		} catch {
+			// Not an executable on this PATH entry.
+		}
+	}
+	return false;
+}
+
+/**
+ * Check if running in a remote session (SSH, devcontainer, etc.)
+ * Honors PLANNOTATOR_REMOTE as a tri-state override, or detects SSH_TTY/SSH_CONNECTION.
+ */
+function getRemoteOverride(): boolean | null {
+	const remote = process.env.PLANNOTATOR_REMOTE;
+	if (remote === undefined) {
+		return null;
+	}
+
+	if (remote === "1" || remote?.toLowerCase() === "true") {
+		return true;
+	}
+
+	if (remote === "0" || remote?.toLowerCase() === "false") {
+		return false;
+	}
+
+	return null;
+}
+
+export function isRemoteSession(): boolean {
+	const remoteOverride = getRemoteOverride();
+	if (remoteOverride !== null) {
+		return remoteOverride;
+	}
+	// Legacy SSH detection
+	if (process.env.SSH_TTY || process.env.SSH_CONNECTION) {
+		return true;
+	}
+	return false;
+}
+
+/**
+ * Get the server ports to try, in order.
+ * - PLANNOTATOR_PORT accepts a fixed port or inclusive range
+ * - Remote sessions default to 19432 (for port forwarding)
+ * - Local sessions use a random port
+ */
+export function getServerPorts(): {
+	ports: number[];
+	portSource: "env" | "remote-default" | "random";
+} {
+	const configuration = getServerPortConfiguration();
+	return {
+		ports: configuration.ports,
+		portSource: configuration.portSource,
+	};
+}
+
+function getServerPortConfiguration(): {
+	ports: number[];
+	portSource: "env" | "remote-default" | "random";
+	isRange: boolean;
+} {
+	const envPort = process.env.PLANNOTATOR_PORT;
+	if (envPort) {
+		const parsed = parsePortSelection(envPort);
+		if (parsed) {
+			return {
+				ports: parsed.ports,
+				portSource: "env",
+				isRange: parsed.kind === "range",
+			};
+		}
+		// Invalid port - fall back silently, caller can check env var themselves
+	}
+	if (isRemoteSession()) {
+		return {
+			ports: [DEFAULT_REMOTE_PORT],
+			portSource: "remote-default",
+			isRange: false,
+		};
+	}
+	return { ports: [0], portSource: "random", isRange: false };
+}
+
+export function getServerPort(): {
+	port: number;
+	portSource: "env" | "remote-default" | "random";
+} {
+	const { ports, portSource } = getServerPorts();
+	return { port: ports[0], portSource };
+}
+
+export function getServerHostname(): string {
+	return isRemoteSession() ? "0.0.0.0" : LOOPBACK_HOST;
+}
+
+/** True when the advertised-URL host is overridden away from localhost. */
+export function isUrlHostOverridden(): boolean {
+	const host = resolveUrlHost(loadConfig());
+	if (host === undefined) return false;
+	if (isAutoUrlHost(host)) return isRemoteSession() && resolveAutoHostCached() !== undefined;
+	return true;
+}
+
+let warnedLocalUrlHost = false;
+
+/**
+ * Compose the URL advertised to the user for a bound port (issue #657).
+ * Display-only: the PLANNOTATOR_URL_HOST / urlHost override changes what is
+ * printed and opened, never which interface the server listens on
+ * (getServerHostname). Remote sessions only: a local session binds loopback,
+ * so honoring the override would advertise (and auto-open) a URL nothing is
+ * listening on — the override is ignored with a once-per-process warning.
+ * The "auto" sentinel resolves the host from Tailscale (resolveAutoHost).
+ * Same-machine subprocesses must not use this — they get a loopback URL so a
+ * tailnet-only hostname can't break local agent jobs.
+ * Mirrors packages/server/remote.ts — keep the two behaviorally identical.
+ */
+export function buildAdvertisedUrl(port: number): string {
+	const host = resolveUrlHost(loadConfig());
+	if (host === undefined) return `http://localhost:${port}`;
+	if (!isRemoteSession()) {
+		if (!warnedLocalUrlHost) {
+			warnedLocalUrlHost = true;
+			process.stderr.write(
+				`[plannotator] Warning: advertised URL host ${JSON.stringify(host)} ignored — this is a local session, so the server binds loopback and only localhost is reachable. Set PLANNOTATOR_REMOTE=1 to use the override.\n`,
+			);
+		}
+		return `http://localhost:${port}`;
+	}
+	const resolved = isAutoUrlHost(host) ? resolveAutoHostCached() : host;
+	if (resolved === undefined) return `http://localhost:${port}`;
+	return `http://${resolved}:${port}`;
+}
+
+const MAX_RETRIES = 5;
+const RETRY_DELAY_MS = 500;
+
+export async function listenOnPort(
+	server: Server,
+): Promise<{ port: number; portSource: "env" | "remote-default" | "random" }> {
+	const { ports, portSource, isRange } = getServerPortConfiguration();
+	const portsToTry = isRange ? ports : Array(MAX_RETRIES).fill(ports[0]);
+
+	for (const [index, port] of portsToTry.entries()) {
+		try {
+			await new Promise<void>((resolve, reject) => {
+				const onError = (error: Error) => {
+					cleanup();
+					reject(error);
+				};
+				const onListening = () => {
+					cleanup();
+					resolve();
+				};
+				const cleanup = () => {
+					server.removeListener("error", onError);
+					server.removeListener("listening", onListening);
+				};
+
+				server.once("error", onError);
+				server.once("listening", onListening);
+				try {
+					server.listen(port, getServerHostname());
+				} catch (error: unknown) {
+					cleanup();
+					reject(error);
+				}
+			});
+			const addr = server.address() as { port: number };
+			return { port: addr.port, portSource };
+		} catch (err: unknown) {
+			const isAddressInUse = isAddressInUseError(err);
+			if (isAddressInUse && index < portsToTry.length - 1) {
+				if (!isRange) {
+					await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+				}
+				continue;
+			}
+			if (isAddressInUse) {
+				if (!isRange) {
+					const hint = isRemoteSession()
+						? " (set PLANNOTATOR_PORT to use a different port)"
+						: "";
+					throw new Error(`Port ${port} in use after ${MAX_RETRIES} retries${hint}`);
+				}
+
+				const configured = `${ports[0]}-${ports.at(-1)}`;
+				const hint = isRemoteSession()
+					? " (set PLANNOTATOR_PORT to use a different port or range)"
+					: "";
+				throw new Error(`Port selection ${configured} exhausted${hint}`);
+			}
+			throw err;
+		}
+	}
+
+	// Unreachable, but satisfies TypeScript
+	throw new Error("Failed to bind port");
+}
+
+/**
+ * Open URL in system browser (Node-compatible, no Bun $ dependency).
+ * Honors PLANNOTATOR_BROWSER and BROWSER env vars.
+ * Returns { opened: true } if browser was opened, { opened: false, isRemote: true, url } if remote session.
+ */
+function findCommandOnPath(command: string): string | null {
+	const extensions = process.platform === "win32" ? [".cmd", ".exe", ".bat", ""] : [""];
+	for (const dir of (process.env.PATH || "").split(delimiter)) {
+		if (!dir) continue;
+		for (const ext of extensions) {
+			const candidate = join(dir, `${command}${ext}`);
+			if (existsSync(candidate)) return candidate;
+		}
+	}
+	return null;
+}
+
+function buildGlimpseHtml(url: string): string {
+	const encodedUrl = JSON.stringify(url);
+	return `<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8" />
+		<title>Plannotator</title>
+		<style>
+			html, body { width: 100%; height: 100%; margin: 0; }
+			body { overflow: hidden; background: #0f1115; }
+		</style>
+	</head>
+	<body>
+		<script>
+			location.replace(${encodedUrl});
+		</script>
+	</body>
+</html>`;
+}
+
+async function openGlimpse(url: string): Promise<boolean> {
+	const glimpseCli = findCommandOnPath("glimpseui");
+	if (!glimpseCli) return false;
+
+	const args = [
+		"--width",
+		String(Number(process.env.PLANNOTATOR_GLIMPSE_WIDTH || 1280)),
+		"--height",
+		String(Number(process.env.PLANNOTATOR_GLIMPSE_HEIGHT || 900)),
+		"--title",
+		"Plannotator",
+		"--open-links",
+	];
+	const html = buildGlimpseHtml(url);
+
+	return await new Promise<boolean>((resolve) => {
+		let settled = false;
+		let successTimer: ReturnType<typeof setTimeout> | undefined;
+		const finish = (opened: boolean) => {
+			if (settled) return;
+			settled = true;
+			if (successTimer) clearTimeout(successTimer);
+			resolve(opened);
+		};
+
+		const child = spawn(glimpseCli, args, {
+			detached: true,
+			stdio: ["pipe", "ignore", "ignore"],
+		});
+		successTimer = setTimeout(() => {
+			child.unref();
+			finish(true);
+		}, 750);
+
+		child.once("error", () => finish(false));
+		child.once("exit", () => finish(false));
+		child.stdin.once("error", () => finish(false));
+		child.stdin.end(html);
+	});
+}
+
+export async function openBrowser(url: string): Promise<{
+	opened: boolean;
+	isRemote?: boolean;
+	url?: string;
+}> {
+	const rawPlannotatorBrowser = process.env.PLANNOTATOR_BROWSER;
+	const rawBrowser = process.env.BROWSER;
+	const plannotatorBrowser = isNoOpBrowserSentinel(rawPlannotatorBrowser)
+		? undefined
+		: rawPlannotatorBrowser;
+	const envBrowser = isNoOpBrowserSentinel(rawBrowser) ? undefined : rawBrowser;
+	const browser = plannotatorBrowser || envBrowser;
+	if (isRemoteSession() && !browser) {
+		return { opened: false, isRemote: true, url };
+	}
+
+	if (!browser && resolveUseGlimpse(loadConfig())) {
+		const openedViaGlimpse = await openGlimpse(url);
+		if (openedViaGlimpse) {
+			return { opened: true };
+		}
+	}
+
+	try {
+		const platform = process.platform;
+		const wsl =
+			platform === "linux" && os.release().toLowerCase().includes("microsoft");
+		// Under WSL a Linux executable must run directly; cmd.exe only wins for
+		// Windows targets (a .exe, a C:\ path, a /mnt/<drive> path).
+		const viaCmdExe =
+			(platform === "win32" || wsl) &&
+			!!plannotatorBrowser &&
+			!(wsl && isPosixBrowserTarget(plannotatorBrowser));
+
+		let cmd: string;
+		let args: string[];
+
+		if (browser) {
+			if (plannotatorBrowser && platform === "darwin") {
+				if (
+					plannotatorBrowser.includes("/") &&
+					!plannotatorBrowser.endsWith(".app")
+				) {
+					// Script/executable path — run directly (open -a fails with -10811)
+					cmd = plannotatorBrowser;
+					args = [url];
+				} else {
+					cmd = "open";
+					args = ["-a", plannotatorBrowser, url];
+				}
+			} else if (viaCmdExe) {
+				cmd = "cmd.exe";
+				args = ["/c", "start", "", plannotatorBrowser, url];
+			} else {
+				cmd = browser;
+				args = [url];
+			}
+		} else if (platform === "win32" || wsl) {
+			cmd = "cmd.exe";
+			args = ["/c", "start", "", url];
+		} else if (platform === "darwin") {
+			cmd = "open";
+			args = [url];
+		} else {
+			cmd = "xdg-open";
+			args = [url];
+		}
+
+		const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+		// A failed launch exists only as an async "error" event; reporting
+		// opened: true unconditionally hides it (#1472).
+		const spawnError = await new Promise<Error | undefined>((resolve) => {
+			child.once("spawn", () => resolve(undefined));
+			child.once("error", (error) => resolve(error));
+		});
+		if (spawnError) {
+			if (plannotatorBrowser) {
+				process.stderr.write(
+					`Plannotator: could not launch PLANNOTATOR_BROWSER="${plannotatorBrowser}": ${spawnError.message}\n`,
+				);
+			}
+			return { opened: false };
+		}
+		child.unref();
+		return { opened: true };
+	} catch {
+		return { opened: false };
+	}
+}
