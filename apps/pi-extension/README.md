@@ -23,6 +23,16 @@ pi install ./plannotator/apps/pi-extension
 pi -e npm:@plannotator/pi-extension
 ```
 
+### Fork distribution
+
+The `ian-ross/plannotator` fork builds a standalone package on its `plannotator-pi` branch:
+
+```bash
+pi install git:github.com/ian-ross/plannotator@plannotator-pi
+```
+
+Remove any existing Plannotator installation first to avoid loading two copies. See the [fork distribution instructions](https://github.com/ian-ross/plannotator/blob/main/docs/pi-distribution.md) for setup, updates, and local checks.
+
 ## Pi version and project trust
 
 Plannotator requires **Pi 0.79.1 or newer**. Updating only the Plannotator
