@@ -1,7 +1,7 @@
 # Plannotator Pi distribution
 
 This branch is generated. Make changes on the source branch, not here.
-Source: https://github.com/ian-ross/plannotator/commit/b463b0f1dcd58fdd82dccce8e6ddd63c712ff504
+Source: https://github.com/ian-ross/plannotator/commit/62c5de58f00419ae0ecf95e518c80240baa83cc6
 
 ```bash
 pi install git:github.com/ian-ross/plannotator@plannotator-pi
