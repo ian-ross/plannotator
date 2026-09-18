@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -26,9 +26,19 @@ export function prepareDistribution(root, output, sourceRepository, sourceCommit
 
   const temp = mkdtempSync(join(tmpdir(), "pi-distribution-pack-"));
   try {
-    // Use the same file selection as the npm release, without running its build hooks.
+    // npm 10 runs prepare during pack even with --ignore-scripts. Remove hooks
+    // from a temporary copy, keeping the source manifest and npm's file selection intact.
+    const staging = join(temp, "extension");
+    cpSync(extension, staging, {
+      recursive: true,
+      filter: (path) => !["node_modules", ".git"].includes(basename(path)),
+    });
+    const stagingManifestPath = join(staging, "package.json");
+    const stagingManifest = JSON.parse(readFileSync(stagingManifestPath, "utf8"));
+    delete stagingManifest.scripts;
+    writeFileSync(stagingManifestPath, `${JSON.stringify(stagingManifest, null, 2)}\n`);
     const [packed] = JSON.parse(execFileSync("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", temp], {
-      cwd: extension, encoding: "utf8",
+      cwd: staging, encoding: "utf8",
     }));
     mkdirSync(output);
     execFileSync("tar", ["-xzf", join(temp, packed.filename), "--strip-components=1", "-C", output]);
@@ -37,7 +47,6 @@ export function prepareDistribution(root, output, sourceRepository, sourceCommit
     }
     const manifestPath = join(output, "package.json");
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-    delete manifest.scripts;
     delete manifest.devDependencies;
     delete manifest.workspaces;
     manifest.private = true;

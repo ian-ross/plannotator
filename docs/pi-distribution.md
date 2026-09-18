@@ -38,7 +38,7 @@ For a fixed version, replace `plannotator-pi` with a commit SHA from the distrib
 
 ## What the workflow checks
 
-The build job installs locked Bun dependencies, tests the packaging and Git publication scripts, and runs `bun run build:pi`. It uses `npm pack --ignore-scripts` to select the extension's published files, then removes build scripts and development dependencies. The generated manifest keeps runtime and peer dependencies and sets `private: true` to prevent accidental npm publication.
+The build job installs locked Bun dependencies, tests the packaging and Git publication scripts, and runs `bun run build:pi`. It packs a temporary copy of the extension with lifecycle scripts removed, since npm 10 runs `prepare` even with `--ignore-scripts`. `npm pack` still applies the package's `files` list and ignore rules. The job then removes development dependencies. The generated manifest keeps runtime and peer dependencies and sets `private: true` to prevent accidental npm publication.
 
 The job generates an npm lockfile and runs `npm ci --omit=dev` in a temporary consumer outside the monorepo. A Pi smoke test loads that package and checks that selecting a plan filename enters planning without an agent turn or an empty plan file.
 

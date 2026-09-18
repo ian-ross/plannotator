@@ -29,7 +29,7 @@ function fixture() {
     name: "@plannotator/pi-extension", version: "0.0.0", type: "module",
     pi: { extensions: ["./"], skills: ["skills/plannotator/SKILL.md"] },
     files: ["index.ts", "plannotator-events.ts", "plannotator.json", "generated/", "skills/", "*.html", "README.md"],
-    scripts: { prepack: "exit 55", prepare: "exit 55", prepublishOnly: "exit 55", build: "exit 55" },
+    scripts: { prepack: "exit 55", prepare: "exit 55", postpack: "exit 55", prepublishOnly: "exit 55", build: "exit 55" },
     dependencies: { diff: "^8.0.4" },
     peerDependencies: { "@earendil-works/pi-coding-agent": ">=0.79.1" },
     devDependencies: { glimpseui: "^0.8.0" },
@@ -75,7 +75,12 @@ function expectPublished(result: ReturnType<typeof publish>) {
 
 test("packs runtime files at the root without invoking hooks or retaining build dependencies", () => {
   const f = fixture();
+  const sourceManifest = readFileSync(join(f.extension, "package.json"), "utf8");
+  write(join(f.extension, "generated/.npmignore"), "excluded.ts\n");
+  write(join(f.extension, "generated/excluded.ts"), "not shipped");
   prepareDistribution(f.source, f.output, repository, sha);
+  expect(readFileSync(join(f.extension, "package.json"), "utf8")).toBe(sourceManifest);
+  expect(existsSync(join(f.output, "generated/excluded.ts"))).toBe(false);
   const manifest = JSON.parse(readFileSync(join(f.output, "package.json"), "utf8"));
   expect(manifest.private).toBe(true);
   expect(manifest.scripts).toBeUndefined();
@@ -109,8 +114,10 @@ test("rejects missing build output before packing", () => {
 test("rejects a manifest that excludes required generated files", () => {
   const f = fixture();
   f.manifest.files = f.manifest.files.filter(file => file !== "generated/");
-  write(join(f.extension, "package.json"), JSON.stringify(f.manifest));
+  const sourceManifest = JSON.stringify(f.manifest);
+  write(join(f.extension, "package.json"), sourceManifest);
   expect(() => prepareDistribution(f.source, f.output, repository, sha)).toThrow("Package manifest excluded required file");
+  expect(readFileSync(join(f.extension, "package.json"), "utf8")).toBe(sourceManifest);
 });
 
 test("rejects malformed source metadata", () => {
